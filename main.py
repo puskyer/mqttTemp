@@ -1,4 +1,4 @@
-#!/usr/bin/python3.8
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 # import the module
@@ -79,23 +79,27 @@ mqttJson = {
         }
 }
 
-# mosquitto_sub -v  -h mqtt.lan -u mqttUser -P MqttPass  -t fireplacefan/tele/SENSOR
+# mosquitto_sub -v  -h mqtt.lan -u mqttUser -P MqttPass  -t HotTubTemp/tele/SENSOR
 # PowR2/tele/SENSOR = {"Time":"2021-11-17T18:08:34","ENERGY":{"TotalStartTime":"2021-11-17T16:12:22","Total":0.734,
 # "Yesterday":0.000,"Today":0.734,"Period": 0,"Power": 0,"ApparentPower": 0,"ReactivePower": 0,"Factor":0.00,
 # "Voltage":119,"Current":0.000}}
 
-# fireplacefan/tele/SENSOR = {"Time":"2021-11-17T17:13:36","DS18B20":{"Id":"05167219F3FF","Temperature":32.3},"TempUnit":"C"}
+# HotTubTemp/tele/SENSOR = {"Time":"2021-11-17T17:13:36","DS18B20":{"Id":"05167219F3FF","Temperature":32.3},"TempUnit":"C"}
 
-topic_fp_SENSOR = "fireplacefan/tele/SENSOR"
+topic_fp_SENSOR = "HotTubTemp/tele/SENSOR"
 topic_pow_SENSOR = "PowR2/tele/SENSOR"
 topic_sub = [(topic_fp_SENSOR,0),(topic_pow_SENSOR,0)]
+pow_conntected = False
 
-topic_pub_POWER = b'fireplacefan/cmnd/POWER'
-topic_pub_STATUS = "fireplacefan/cmnd/STATUS"
-topic_pub = "fireplacefan/stat/python"
-last_temp = 0.0
+topic_pub_POWER = b'HotTubTemp/cmnd/POWER'
+topic_pub_STATUS = "HotTubTemp/cmnd/STATUS"
+topic_pub = "HotTubTemp/stat/python"
+last_temp_left = 0
+last_temp_right = 0
 PowR2EmailOnce = 0
 last_time_check = 0
+last_email_check = time.localtime().tm_min
+email_control = True
 
 async def getweather():
     # declare the client. format defaults to the metric system (celcius, km/h, etc.)
@@ -185,9 +189,12 @@ def connect_mqtt():
 def subscribe(client: mqtt_client):
 
     def on_message(client, userdata, msg):
-        global last_temp
+        global last_temp_left
+        global last_temp_right
         global PowR2EmailOnce
         global last_time_check
+        global last_email_check
+        global email_control
         tempmqttdata = json.loads(msg.payload.decode())
         print(f"Received `{tempmqttdata}` from `{msg.topic}` topic")
 
@@ -220,7 +227,7 @@ def subscribe(client: mqtt_client):
                 # covert to celsius
                 mqttJson["TH16"]["TemperatureC"] = round(((tempmqttdata['DS18B20']['Temperature'] - 32) / 1.8), 2)
                 mqttJson["TH16"]["Unit"] = "C"
-        elif msg.topic == topic_pow_SENSOR:
+        elif msg.topic == topic_pow_SENSOR and pow_conntected:
             mytime = time.localtime()
             mqttJson["PowR2"]["Date"] = str(mytime[0]) + '/' + str(mytime[1]) + '/' + str(mytime[2])
             mqttJson["PowR2"]["Time"] = str(mytime[3]) + ':' + str(mytime[4]) + ':' + str(mytime[5])
@@ -256,8 +263,19 @@ def subscribe(client: mqtt_client):
             data_file.write(JsonMqtt)
             data_file.write(",")
             data_file.close()
-        if int( mqttJson["TH16"]["TemperatureC"]) != last_temp or (mqttJson["PowR2"]["PowR2 State"] == "ON" and PowR2EmailOnce == 1):
-            last_temp = int( mqttJson["TH16"]["TemperatureC"])
+        lrtemp = str(mqttJson["TH16"]["TemperatureC"])
+        l, r = map(int, lrtemp.split(".", 1))
+
+        print(last_email_check, email_control)
+        if time.localtime().tm_min > (last_email_check+10):
+                print(last_email_check)
+                last_email_check = time.localtime().tm_min
+                email_control = True
+
+        if int((l !=  last_temp_left and r == 0 and email_control) or (mqttJson["PowR2"]["PowR2 State"] == "ON" and PowR2EmailOnce == 1)):
+            email_control = False
+            last_temp_left = [l]
+            last_temp_right = [r]
             text = '\r\n'.join(['Weather in %s ' % mqttJson["weather"]["observation_point"],
                                 'Date / Time %s ' % time.asctime(),
                                 'Humidity is %s' % mqttJson["weather"]["humidity"],
