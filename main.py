@@ -1,4 +1,4 @@
-#!/usr/bin/python3.8
+#!/usr/bin/python3.9
 # -*- coding: utf-8 -*-
 
 # import the module
@@ -169,7 +169,7 @@ def connect_mqtt():
             print("Failed to connect, return code %d\n", rc)
 
     # Set Connecting Client ID
-    mqttclient = mqtt_client.Client(client_id)
+    mqttclient = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION1,client_id)
     mqttclient.username_pw_set(username, password)
     mqttclient.on_connect = on_connect
     mqttclient.connect(broker, port)
