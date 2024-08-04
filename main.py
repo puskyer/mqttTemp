@@ -79,23 +79,30 @@ mqttJson = {
         }
 }
 
-# mosquitto_sub -v  -h mqtt.lan -u mqttUser -P MqttPass  -t fireplacefan/tele/SENSOR
+# mosquitto_sub -v  -h mqtt.lan -u mqttUser -P MqttPass  -t HotTubTemp/tele/SENSOR
 # PowR2/tele/SENSOR = {"Time":"2021-11-17T18:08:34","ENERGY":{"TotalStartTime":"2021-11-17T16:12:22","Total":0.734,
 # "Yesterday":0.000,"Today":0.734,"Period": 0,"Power": 0,"ApparentPower": 0,"ReactivePower": 0,"Factor":0.00,
 # "Voltage":119,"Current":0.000}}
 
-# fireplacefan/tele/SENSOR = {"Time":"2021-11-17T17:13:36","DS18B20":{"Id":"05167219F3FF","Temperature":32.3},"TempUnit":"C"}
+# HotTubTemp/tele/SENSOR =
+# {"Time":"2021-11-17T17:13:36","DS18B20":{"Id":"05167219F3FF","Temperature":32.3},"TempUnit":"C"}
 
-topic_fp_SENSOR = "fireplacefan/tele/SENSOR"
+topic_fp_SENSOR = "HotTubTemp/tele/SENSOR"
 topic_pow_SENSOR = "PowR2/tele/SENSOR"
-topic_sub = [(topic_fp_SENSOR,0),(topic_pow_SENSOR,0)]
+topic_sub = [(topic_fp_SENSOR, 0), (topic_pow_SENSOR, 0)]
+pow_conntected = False
 
-topic_pub_POWER = b'fireplacefan/cmnd/POWER'
-topic_pub_STATUS = "fireplacefan/cmnd/STATUS"
-topic_pub = "fireplacefan/stat/python"
-last_temp = 0.0
+topic_pub_POWER = b'HotTubTemp/cmnd/POWER'
+topic_pub_STATUS = "HotTubTemp/cmnd/STATUS"
+topic_pub = "HotTubTemp/stat/python"
+last_temp_left = 0
+last_temp_right = 0
 PowR2EmailOnce = 0
 last_time_check = 0
+last_email_check = int(time.time())
+NumSecBetweenEmails = 900
+email_control = True
+
 
 async def getweather():
     # declare the client. format defaults to the metric system (celcius, km/h, etc.)
@@ -112,14 +119,16 @@ async def getweather():
         # convert to fahrenheit
         mqttJson["weather"]["TemperatureF"] = round(((mqttJson["weather"]["Temperature"] * 1.8) + 32), 2)
         mqttJson["weather"]["UnitF"] = "F"
-        mqttJson["weather"]["feels_like"] = str(weather.current.feels_like) + " " + weather.degree_type + " / " + str(round(((weather.current.feels_like * 1.8) + 32), 2)) + " F"
+        mqttJson["weather"]["feels_like"] = (str(weather.current.feels_like) + " " + weather.degree_type
+                                             + " / " + str(round(((weather.current.feels_like * 1.8) + 32), 2)) + " F")
     else:
         mqttJson["weather"]["TemperatureF"] = weather.current.temperature
         mqttJson["weather"]["UnitF"] = weather.degree_type
         # covert to celsius
         mqttJson["weather"]["Temperature"] = round(((mqttJson["weather"]["Temperature"] - 32) / 1.8), 2)
         mqttJson["weather"]["degree_type"] = "C"
-        mqttJson["weather"]["feels_like"] = str(round(((weather.current.feels_like - 32) / 1.8), 2)) + " F / " + str(weather.current.feels_like) + " " + weather.degree_type
+        mqttJson["weather"]["feels_like"] = (str(round(((weather.current.feels_like - 32) / 1.8), 2)) + " F / "
+                                             + str(weather.current.feels_like) + " " + weather.degree_type)
 
     mqttJson["weather"]["humidity"] = weather.current.humidity
     mqttJson["weather"]["wind_display"] = weather.current.wind_display
@@ -130,10 +139,11 @@ async def getweather():
     mqttJson["weather"]["date"]["hour"] = weather.forecasts[0].date.hour
     mqttJson["weather"]["date"]["minutes"] = weather.forecasts[0].date.minute
     mqttJson["weather"]["day"] = weather.current.day
-    mqttJson["weather"]["observation_point"]  = weather.current.observation_point
+    mqttJson["weather"]["observation_point"] = weather.current.observation_point
 
     # close the wrapper once done
     await weatherclient.close()
+
 
 def sendemail(subject, text):
     to = DataJson["email"]["To"]
@@ -149,7 +159,7 @@ def sendemail(subject, text):
 
     context = ssl.create_default_context()
     with smtplib.SMTP(smtp_server, smtp_port) as server:
-        #server.set_debuglevel(1)
+        # server.set_debuglevel(1)
         server.ehlo()
         server.starttls(context=context)
         server.ehlo()
@@ -161,13 +171,24 @@ def sendemail(subject, text):
             print('error sending mail')
         server.quit()
 
-def connect_mqtt():
-    def on_connect(client, userdata, flags, rc):
-        if rc == 0:
-            print("Connected to MQTT Broker!")
-        else:
-            print("Failed to connect, return code %d\n", rc)
+# Connection Return Codes
 
+#    0: Connection successful
+#    1: Connection refused – incorrect protocol version
+#    2: Connection refused – invalid client identifier
+#    3: Connection refused – server unavailable
+#    4: Connection refused – bad username or password
+#    5: Connection refused – not authorised
+#    6-255: Currently unused.
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("Connected to MQTT Broker!")
+    else:
+        print("Failed to connect, return code %d\n", rc)
+
+
+def connect_mqtt():
     # Set Connecting Client ID
     mqttclient = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION1,client_id)
     mqttclient.username_pw_set(username, password)
@@ -182,117 +203,145 @@ def connect_mqtt():
 # "Yesterday":0.000,"Today":0.734,"Period": 0,"Power": 0,"ApparentPower": 0,"ReactivePower": 0,"Factor":0.00,
 # "Voltage":119,"Current":0.000}}
 
+def on_message(client, userdata, msg):
+    global last_temp_left
+    global last_temp_right
+    global PowR2EmailOnce
+    global last_time_check
+    global last_email_check
+    global email_control
+    tempmqttdata = json.loads(msg.payload.decode())
+    print(f"Received `{tempmqttdata}` from `{msg.topic}` topic")
+
+    if time.localtime().tm_hour != last_time_check:
+        try:
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(getweather())
+            last_time_check = time.localtime().tm_hour
+        except:
+            print("Get Weather failed!")
+            last_time_check = time.localtime().tm_hour
+
+    if msg.topic == topic_fp_SENSOR:
+        mytime = time.localtime()
+        mqttJson["TH16"]["Date"] = str(mytime[0]) + '/' + str(mytime[1]) + '/' + str(mytime[2])
+        mqttJson["TH16"]["Time"] = str(mytime[3]) + ':' + str(mytime[4]) + ':' + str(mytime[5])
+        tempdate = tempmqttdata['Time']
+        tempSdate = tempdate.split("T")
+        mqttJson["TH16"]["Device Date"] = tempSdate[0]
+        mqttJson["TH16"]["Device Time"] = tempSdate[1]
+        if tempmqttdata['TempUnit'] == "C":
+            mqttJson["TH16"]["TemperatureC"] = tempmqttdata['DS18B20']['Temperature']
+            mqttJson["TH16"]["Unit"] = tempmqttdata['TempUnit']
+            # convert to fahrenheit
+            mqttJson["TH16"]["TemperatureF"] = round(((tempmqttdata['DS18B20']['Temperature'] * 1.8) + 32), 2)
+            mqttJson["TH16"]["UnitF"] = "F"
+        else:
+            mqttJson["TH16"]["TemperatureF"] = tempmqttdata['DS18B20']['Temperature']
+            mqttJson["TH16"]["UnitF"] = tempmqttdata['TempUnit']
+            # covert to celsius
+            mqttJson["TH16"]["TemperatureC"] = round(((tempmqttdata['DS18B20']['Temperature'] - 32) / 1.8), 2)
+            mqttJson["TH16"]["Unit"] = "C"
+    elif msg.topic == topic_pow_SENSOR and pow_conntected:
+        mytime = time.localtime()
+        mqttJson["PowR2"]["Date"] = str(mytime[0]) + '/' + str(mytime[1]) + '/' + str(mytime[2])
+        mqttJson["PowR2"]["Time"] = str(mytime[3]) + ':' + str(mytime[4]) + ':' + str(mytime[5])
+        tempdate = tempmqttdata["ENERGY"]["TotalStartTime"]
+        tempSdate = tempdate.split("T")
+        mqttJson["PowR2"]["ENERGY"]["TotalStartDate"] = tempSdate[0]
+        mqttJson["PowR2"]["ENERGY"]["TotalStartTime"] = tempSdate[1]
+        mqttJson["PowR2"]["ENERGY"]["Total"] = tempmqttdata["ENERGY"]["Total"]
+        mqttJson["PowR2"]["ENERGY"]["Yesterday"] = tempmqttdata["ENERGY"]["Yesterday"]
+        mqttJson["PowR2"]["ENERGY"]["Today"] = tempmqttdata["ENERGY"]["Today"]
+        mqttJson["PowR2"]["ENERGY"]["Period"] = tempmqttdata["ENERGY"]["Period"]
+        mqttJson["PowR2"]["ENERGY"]["Power"] = tempmqttdata["ENERGY"]["Power"]
+        mqttJson["PowR2"]["ENERGY"]["ApparentPower"] = tempmqttdata["ENERGY"]["ApparentPower"]
+        mqttJson["PowR2"]["ENERGY"]["ReactivePower"] = tempmqttdata["ENERGY"]["ReactivePower"]
+        mqttJson["PowR2"]["ENERGY"]["Factor"] = tempmqttdata["ENERGY"]["Factor"]
+        mqttJson["PowR2"]["ENERGY"]["Voltage"] = tempmqttdata["ENERGY"]["Voltage"]
+        mqttJson["PowR2"]["ENERGY"]["Current"] = tempmqttdata["ENERGY"]["Current"]
+
+        # fahrenheit = (celsius * 1.8) + 32
+        # celsius = (fahrenheit - 32) / 1.8
+
+        if (mqttJson["PowR2"]["ENERGY"]["Power"] != 0 and PowR2EmailOnce == 0):
+            mqttJson["PowR2"]["PowR2 State"] = "ON"
+            PowR2EmailOnce = 1
+        elif (mqttJson["PowR2"]["ENERGY"]["Power"] == 0 and PowR2EmailOnce == 2):
+            mqttJson["PowR2"]["PowR2 State"] = "OFF"
+            PowR2EmailOnce = 0
+
+    JsonMqtt = json.dumps(mqttJson)
+    # config.json data file
+    data_file: TextIO
+    with open('temperature.json', "a") as data_file:
+        data_file.write(JsonMqtt)
+        data_file.write(",")
+        data_file.close()
+    lrtemp = str(mqttJson["TH16"]["TemperatureC"])
+    l, r = map(int, lrtemp.split(".", 1))
+
+    # print(last_email_check, email_control)
+    if ((int(time.time()) - last_email_check) > NumSecBetweenEmails):
+        # print(last_email_check)
+        last_email_check = int(time.time())
+        email_control = True
+        # print((last_email_check), email_control)
+
+    if (email_control and ((l != last_temp_left and last_temp_right == 0)
+       or (mqttJson["PowR2"]["PowR2 State"] == "ON" and PowR2EmailOnce == 1))):
+        email_control = False
+        last_temp_left = [l]
+        last_temp_right = [r]
+        text = '\r\n'.join(['Weather in %s ' % mqttJson["weather"]["observation_point"],
+                            'Date / Time %s ' % time.asctime(),
+                            'Humidity is %s' % mqttJson["weather"]["humidity"],
+                            'Possibility of %s' % mqttJson["weather"]["sky_text"],
+                            'Wind is %s' % mqttJson["weather"]["wind_display"],
+                            'Temperature is %s %s / %s %s' % (mqttJson["weather"]["Temperature"], mqttJson["weather"]["degree_type"], mqttJson["weather"]["TemperatureF"], mqttJson["weather"]["UnitF"]),
+                            'Feels Like %s ' % mqttJson["weather"]["feels_like"],
+                            'Hot Tub Temperature is %s  %s / %s %s' % (mqttJson["TH16"]["TemperatureC"], mqttJson["TH16"]["Unit"], mqttJson["TH16"]["TemperatureF"], mqttJson["TH16"]["UnitF"]),
+                            'TH16 Date is %s' % mqttJson["TH16"]["Device Date"],
+                            'TH16 Time is %s' % mqttJson["TH16"]["Device Time"],
+                            'PowR2 stat %s' % mqttJson["PowR2"]["PowR2 State"],
+                            'PowR2 Voltage %s' % mqttJson["PowR2"]["ENERGY"]["Voltage"],
+                            'PowR2 Current %s' % mqttJson["PowR2"]["ENERGY"]["Current"],
+                            'PowR2 Power %s' % mqttJson["PowR2"]["ENERGY"]["Power"],
+                            'PowR2 ApparentPower %s' % mqttJson["PowR2"]["ENERGY"]["ApparentPower"],
+                            'PowR2 Period %s' % mqttJson["PowR2"]["ENERGY"]["Period"],
+                            'PowR2 Today %s' % mqttJson["PowR2"]["ENERGY"]["Today"],
+                            'PowR2 Total %s' % mqttJson["PowR2"]["ENERGY"]["Total"],
+                            'PowR2 Total Start Date %s' % mqttJson["PowR2"]["ENERGY"]["TotalStartDate"],
+                            'PowR2 Total Start Time %s' % mqttJson["PowR2"]["ENERGY"]["TotalStartTime"]
+                            ])
+        sendemail("Hot Tub Temperature change!", text)
+        # print(text)
+        PowR2EmailOnce = 2
+
+
+# mqtt.MQTT_ERR_AGAIN = -1
+# mqtt.MQTT_ERR_SUCCESS = 0
+# mqtt.MQTT_ERR_NOMEM = 1
+# mqtt.MQTT_ERR_PROTOCOL = 2
+# mqtt.MQTT_ERR_INVAL = 3
+# mqtt.MQTT_ERR_NO_CONN = 4
+# mqtt.MQTT_ERR_CONN_REFUSED = 5
+# mqtt.MQTT_ERR_NOT_FOUND = 6
+# mqtt.MQTT_ERR_TLS = 8
+# mqtt.MQTT_ERR_PAYLOAD_SIZE = 9
+# mqtt.MQTT_ERR_NOT_SUPPORTED = 10
+# mqtt.MQTT_ERR_AUTH = 11
+# mqtt.MQTT_ERR_ACL_DENIED = 12
+# mqtt.MQTT_ERR_UNKNOWN = 13
+# mqtt.MQTT_ERR_ERRNO = 14
+# mqtt.MQTT_ERR_QUEUE_SIZE = 15
+
 def subscribe(client: mqtt_client):
-
-    def on_message(client, userdata, msg):
-        global last_temp
-        global PowR2EmailOnce
-        global last_time_check
-        tempmqttdata = json.loads(msg.payload.decode())
-        print(f"Received `{tempmqttdata}` from `{msg.topic}` topic")
-
-        if time.localtime().tm_hour != last_time_check:
-            try:
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(getweather())
-                last_time_check = time.localtime().tm_hour
-            except:
-                print("Get Weather failed!")
-                last_time_check = time.localtime().tm_hour
-
-        if msg.topic == topic_fp_SENSOR:
-            mytime = time.localtime()
-            mqttJson["TH16"]["Date"] = str(mytime[0]) + '/' + str(mytime[1]) + '/' + str(mytime[2])
-            mqttJson["TH16"]["Time"] = str(mytime[3]) + ':' + str(mytime[4]) + ':' + str(mytime[5])
-            tempdate = tempmqttdata['Time']
-            tempSdate = tempdate.split("T")
-            mqttJson["TH16"]["Device Date"] = tempSdate[0]
-            mqttJson["TH16"]["Device Time"] = tempSdate[1]
-            if tempmqttdata['TempUnit'] == "C":
-                mqttJson["TH16"]["TemperatureC"] = tempmqttdata['DS18B20']['Temperature']
-                mqttJson["TH16"]["Unit"] = tempmqttdata['TempUnit']
-                # convert to fahrenheit
-                mqttJson["TH16"]["TemperatureF"] = round(((tempmqttdata['DS18B20']['Temperature'] * 1.8) + 32), 2)
-                mqttJson["TH16"]["UnitF"] = "F"
-            else:
-                mqttJson["TH16"]["TemperatureF"] = tempmqttdata['DS18B20']['Temperature']
-                mqttJson["TH16"]["UnitF"] = tempmqttdata['TempUnit']
-                # covert to celsius
-                mqttJson["TH16"]["TemperatureC"] = round(((tempmqttdata['DS18B20']['Temperature'] - 32) / 1.8), 2)
-                mqttJson["TH16"]["Unit"] = "C"
-        elif msg.topic == topic_pow_SENSOR:
-            mytime = time.localtime()
-            mqttJson["PowR2"]["Date"] = str(mytime[0]) + '/' + str(mytime[1]) + '/' + str(mytime[2])
-            mqttJson["PowR2"]["Time"] = str(mytime[3]) + ':' + str(mytime[4]) + ':' + str(mytime[5])
-            tempdate = tempmqttdata["ENERGY"]["TotalStartTime"]
-            tempSdate = tempdate.split("T")
-            mqttJson["PowR2"]["ENERGY"]["TotalStartDate"] = tempSdate[0]
-            mqttJson["PowR2"]["ENERGY"]["TotalStartTime"] = tempSdate[1]
-            mqttJson["PowR2"]["ENERGY"]["Total"] = tempmqttdata["ENERGY"]["Total"]
-            mqttJson["PowR2"]["ENERGY"]["Yesterday"] = tempmqttdata["ENERGY"]["Yesterday"]
-            mqttJson["PowR2"]["ENERGY"]["Today"] = tempmqttdata["ENERGY"]["Today"]
-            mqttJson["PowR2"]["ENERGY"]["Period"] = tempmqttdata["ENERGY"]["Period"]
-            mqttJson["PowR2"]["ENERGY"]["Power"] = tempmqttdata["ENERGY"]["Power"]
-            mqttJson["PowR2"]["ENERGY"]["ApparentPower"] = tempmqttdata["ENERGY"]["ApparentPower"]
-            mqttJson["PowR2"]["ENERGY"]["ReactivePower"] = tempmqttdata["ENERGY"]["ReactivePower"]
-            mqttJson["PowR2"]["ENERGY"]["Factor"] = tempmqttdata["ENERGY"]["Factor"]
-            mqttJson["PowR2"]["ENERGY"]["Voltage"] = tempmqttdata["ENERGY"]["Voltage"]
-            mqttJson["PowR2"]["ENERGY"]["Current"] = tempmqttdata["ENERGY"]["Current"]
-
-            # fahrenheit = (celsius * 1.8) + 32
-            # celsius = (fahrenheit - 32) / 1.8
-
-            if (mqttJson["PowR2"]["ENERGY"]["Power"] != 0 and PowR2EmailOnce == 0):
-                mqttJson["PowR2"]["PowR2 State"] = "ON"
-                PowR2EmailOnce = 1
-            elif (mqttJson["PowR2"]["ENERGY"]["Power"] == 0 and PowR2EmailOnce == 2):
-                mqttJson["PowR2"]["PowR2 State"] = "OFF"
-                PowR2EmailOnce = 0
-
-        JsonMqtt = json.dumps(mqttJson)
-        # config.json data file
-        data_file: TextIO
-        with open('temperature.json', "a") as data_file:
-            data_file.write(JsonMqtt)
-            data_file.write(",")
-            data_file.close()
-        if int( mqttJson["TH16"]["TemperatureC"]) != last_temp or (mqttJson["PowR2"]["PowR2 State"] == "ON" and PowR2EmailOnce == 1):
-            last_temp = int( mqttJson["TH16"]["TemperatureC"])
-            text = '\r\n'.join(['Weather in %s ' % mqttJson["weather"]["observation_point"],
-                                'Date / Time %s ' % time.asctime(),
-                                'Humidity is %s' % mqttJson["weather"]["humidity"],
-                                'Possibility of %s' % mqttJson["weather"]["sky_text"],
-                                'Wind is %s' % mqttJson["weather"]["wind_display"],
-                                'Temperature is %s %s / %s %s' % (mqttJson["weather"]["Temperature"], mqttJson["weather"]["degree_type"], mqttJson["weather"]["TemperatureF"], mqttJson["weather"]["UnitF"]),
-                                'Feels Like %s ' % mqttJson["weather"]["feels_like"],
-                                'Hot Tub Temperature is %s  %s / %s %s' % (mqttJson["TH16"]["TemperatureC"], mqttJson["TH16"]["Unit"], mqttJson["TH16"]["TemperatureF"], mqttJson["TH16"]["UnitF"]),
-                                'TH16 Date is %s' % mqttJson["TH16"]["Device Date"],
-                                'TH16 Time is %s' % mqttJson["TH16"]["Device Time"],
-                                'PowR2 stat %s' % mqttJson["PowR2"]["PowR2 State"],
-                                'PowR2 Voltage %s' % mqttJson["PowR2"]["ENERGY"]["Voltage"],
-                                'PowR2 Current %s' % mqttJson["PowR2"]["ENERGY"]["Current"],
-                                'PowR2 Power %s' % mqttJson["PowR2"]["ENERGY"]["Power"],
-                                'PowR2 ApparentPower %s' % mqttJson["PowR2"]["ENERGY"]["ApparentPower"],
-                                'PowR2 Period %s' % mqttJson["PowR2"]["ENERGY"]["Period"],
-                                'PowR2 Today %s' % mqttJson["PowR2"]["ENERGY"]["Today"],
-                                'PowR2 Total %s' % mqttJson["PowR2"]["ENERGY"]["Total"],
-                                'PowR2 Total Start Date %s' % mqttJson["PowR2"]["ENERGY"]["TotalStartDate"],
-                                'PowR2 Total Start Time %s' % mqttJson["PowR2"]["ENERGY"]["TotalStartTime"]
-                                ])
-            sendemail("Hot Tub Temperature change!", text)
-            # print(text)
-            PowR2EmailOnce = 2
-
     reply = client.subscribe(topic_sub)
     print(reply)
     client.on_message = on_message
 
-# def publish(client: mqtt_client):
-#    client.publish(topic, msg)
-#    client.connect(broker, port)
-#    return client
-
-def publish(client: mqtt_client):
+def publish(client: mqtt_client, topic, msg):
     time.sleep(1)
     result = client.publish(topic, msg)
     # result: [0, 1]
